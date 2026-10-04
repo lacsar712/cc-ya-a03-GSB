@@ -1,11 +1,14 @@
-"""后台 worker：用 SKIP LOCKED 认领 pending 记录并写入判定结论。"""
+"""后台 worker：用 SKIP LOCKED 认领 pending 记录。
+
+服务端下结论前须扣齿轮箱温漂：结论按补偿后偏航判定，并在同一事务内
+回填对中记录与补偿账。
+"""
 
 import os
 import time
 from datetime import datetime, timezone
 
 import psycopg
-from psycopg.rows import dict_row
 
 from db import SCHEMA, connect
 from rules import judge
@@ -22,7 +25,7 @@ def ensure_schema(conn):
 def claim_and_process(conn) -> bool:
     with conn.transaction():
         row = conn.execute(
-            """SELECT id, turbine_code, yaw_err_deg
+            """SELECT id, COALESCE(compensated_yaw_deg, yaw_err_deg) AS judged_yaw_deg
                FROM yaw_logs
                WHERE status = 'pending'
                ORDER BY id
@@ -31,12 +34,19 @@ def claim_and_process(conn) -> bool:
         ).fetchone()
         if row is None:
             return False
-        verdict, reason = judge(float(row["yaw_err_deg"]))
+        compensated = float(row["judged_yaw_deg"])
+        verdict, reason = judge(compensated)
         now = datetime.now(timezone.utc)
         conn.execute(
             """UPDATE yaw_logs
                SET status = 'done', verdict = %s, reason = %s, processed_at = %s
                WHERE id = %s""",
+            (verdict, reason, now, row["id"]),
+        )
+        conn.execute(
+            """UPDATE comp_ledger
+               SET verdict = %s, reason = %s, processed_at = %s
+               WHERE log_id = %s""",
             (verdict, reason, now, row["id"]),
         )
     return True
